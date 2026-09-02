@@ -1,0 +1,316 @@
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.id);
+
+  socket.on('register-active', (username) => {
+    const u = usersDb.find(u => u.username.toLowerCase() === username.toLowerCase());
+    if (u && u.blockedUntil) {
+      const blockTime = new Date(u.blockedUntil);
+      if (u.blockedUntil === 'permanent' || blockTime > new Date()) {
+        socket.emit('account-blocked', { duration: u.blockedUntil });
+        return;
+      }
+    }
+    const actualUsername = u ? u.username : username;
+    socket.username = actualUsername;
+    activeUsers.set(actualUsername, socket.id);
+  });
+
+  socket.on('private-message', ({ id, to, text, type = 'text', fileUrl }) => {
+    if (!socket.username) return;
+
+    const senderUser = usersDb.find(u => u.username === socket.username);
+    const receiverUser = usersDb.find(u => u.username === to);
+
+    if (senderUser && senderUser.blockedUntil) {
+      const blockTime = new Date(senderUser.blockedUntil);
+      if (senderUser.blockedUntil === 'permanent' || blockTime > new Date()) {
+        socket.emit('chat-error', { message: 'Your account is blocked.' });
+        return;
+      }
+    }
+
+    if (senderUser && receiverUser) {
+      const isSenderAdmin = senderUser.role === 'admin' || senderUser.role === 'superadmin';
+      const isReceiverAdmin = receiverUser.role === 'admin' || receiverUser.role === 'superadmin';
+      const areFriends = (senderUser.friends || []).includes(receiverUser.username) || (receiverUser.friends || []).includes(senderUser.username);
+      const isSystemAdmin = senderUser.username.toLowerCase() === 'admin' || receiverUser.username.toLowerCase() === 'admin';
+
+      if (!isSenderAdmin && !isReceiverAdmin && !areFriends && !isSystemAdmin) {
+        socket.emit('chat-error', { message: 'You can only chat with your friends.' });
+        return;
+      }
+    }
+
+    const msg = {
+      id: id || (Date.now().toString() + Math.random().toString(36).substring(7)),
+      sender: socket.username,
+      receiver: to,
+      text: text,
+      type: type,
+      fileUrl: fileUrl,
+      timestamp: new Date().toISOString()
+    };
+    
+    messagesDb.push(msg);
+    saveMessages();
+
+    // Send to recipient if online
+    const targetSocketId = activeUsers.get(to);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('private-message', msg);
+    }
+  });
+
+  socket.on('private-reaction', ({ messageId, to, emoji }) => {
+    if (!socket.username) return;
+
+    // We don't save private reactions to the db yet to keep it simple,
+    // just relay it in real-time.
+    const targetSocketId = activeUsers.get(to);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('private-reaction', { messageId, emoji, from: socket.username });
+    }
+  });
+
+
+  socket.on('admin-delete-message', ({ messageId }) => {
+    const u = usersDb.find(u => u.username === socket.username);
+    if (!u) return;
+    const msgIndex = messagesDb.findIndex(m => m.id === messageId);
+    if (msgIndex !== -1) {
+      const msg = messagesDb[msgIndex];
+      if (u.role === 'superadmin') {
+        // Can delete anything
+      } else if (u.role === 'admin') {
+        // Can only delete their own message
+        if (msg.sender !== socket.username) return;
+      } else {
+        return; // normal users cannot delete
+      }
+      messagesDb.splice(msgIndex, 1);
+      saveMessages();
+      io.emit('message-deleted', { messageId });
+    }
+  });
+
+  socket.on('admin-clear-chat', ({ targetUser }) => {
+    const u = usersDb.find(u => u.username === socket.username);
+    if (!u || u.role !== 'superadmin') return; // ONLY SUPERADMIN
+    const filtered = messagesDb.filter(m => !(
+      (m.sender === socket.username && m.receiver === targetUser) ||
+      (m.sender === targetUser && m.receiver === socket.username)
+    ));
+    messagesDb.length = 0;
+    messagesDb.push(...filtered);
+    saveMessages();
+    io.emit('chat-cleared', { targetUser });
+  });
+
+  socket.on('direct-call', (targetUsername) => {
+    const targetSocketId = activeUsers.get(targetUsername);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('incoming-direct-call', socket.username);
+    } else {
+      socket.emit('direct-call-failed', { reason: 'User is offline' });
+    }
+  });
+
+  socket.on('direct-call-response', ({ callerUsername, accept }) => {
+    const callerSocketId = activeUsers.get(callerUsername);
+    if (!callerSocketId) return;
+
+    if (accept) {
+      io.to(callerSocketId).emit('call-accepted', socket.username);
+    } else {
+      io.to(callerSocketId).emit('direct-call-failed', { reason: 'Call declined' });
+    }
+  });
+
+  socket.on('join-direct-room', ({ role, partnerUsername, myUsername }) => {
+    socket.username = myUsername;
+    activeUsers.set(myUsername, socket.id);
+    const roomId = [myUsername, partnerUsername].sort().join('_');
+    socket.join(roomId);
+    socket.roomId = roomId;
+
+    const room = io.sockets.adapter.rooms.get(roomId);
+    if (room && room.size === 2) {
+      io.to(roomId).emit('partner-found');
+      
+      const partnerSocketId = activeUsers.get(partnerUsername);
+      if (partnerSocketId) {
+        socket.emit('partner-username', { username: partnerUsername, gender: 'Not Specified' });
+        io.to(partnerSocketId).emit('partner-username', { username: socket.username, gender: socket.preferences?.myGender || 'Not Specified' });
+      }
+
+      if (role === 'caller') {
+        socket.emit('initiate-offer');
+      } else {
+        socket.to(roomId).emit('initiate-offer');
+      }
+    }
+  });
+
+  socket.on('find-partner', (preferences = { myGender: 'Any', interestedIn: 'Any', username: 'Unknown' }) => {
+    socket.preferences = preferences;
+    socket.username = preferences.username;
+    activeUsers.set(preferences.username, socket.id);
+    
+    // Find a compatible partner
+    const matchIndex = waitingUsers.findIndex(u => {
+      if (u.id === socket.id) return false;
+      
+      const partnerWants = u.preferences.interestedIn;
+      const iAm = socket.preferences.myGender;
+      const iWant = socket.preferences.interestedIn;
+      const partnerIs = u.preferences.myGender;
+      
+      const partnerLikesMe = partnerWants === 'Any' || partnerWants === iAm || iAm === 'Any';
+      const iLikePartner = iWant === 'Any' || iWant === partnerIs || partnerIs === 'Any';
+      
+      return partnerLikesMe && iLikePartner;
+    });
+
+    if (matchIndex !== -1) {
+      const partner = waitingUsers.splice(matchIndex, 1)[0];
+
+      const roomId = `room_${partner.id}_${socket.id}`;
+      socket.join(roomId);
+      partner.join(roomId);
+
+      socket.roomId = roomId;
+      partner.roomId = roomId;
+
+      // Notify both that a partner was found
+      io.to(roomId).emit('partner-found');
+      
+      // Exchange usernames
+      socket.emit('partner-username', { username: partner.username, gender: partner.preferences.myGender || 'Not Specified' });
+      partner.emit('partner-username', { username: socket.username, gender: socket.preferences.myGender || 'Not Specified' });
+
+      // We instruct the user who was waiting to start the WebRTC connection by creating an offer
+      partner.emit('initiate-offer');
+    } else {
+      // Ensure we don't push duplicates
+      if (!waitingUsers.find(u => u.id === socket.id)) {
+        waitingUsers.push(socket);
+      }
+    }
+  });
+
+  socket.on('offer', (offer) => {
+    socket.to(socket.roomId).emit('offer', offer);
+  });
+
+  socket.on('answer', (answer) => {
+    socket.to(socket.roomId).emit('answer', answer);
+  });
+
+  socket.on('ice-candidate', (candidate) => {
+    socket.to(socket.roomId).emit('ice-candidate', candidate);
+  });
+
+  socket.on('chat-message', (msg) => {
+    socket.to(socket.roomId).emit('chat-message', msg);
+  });
+
+  socket.on('chat-reaction', (data) => {
+    socket.to(socket.roomId).emit('chat-reaction', data);
+  });
+
+  socket.on('blur-state-change', (isBlurred) => {
+    socket.to(socket.roomId).emit('blur-state-change', isBlurred);
+  });
+
+  socket.on('report-user', (data) => {
+    const { reason, partnerUsername, screenshot } = data;
+    const myUsername = socket.username || 'Unknown';
+    const reportedUser = partnerUsername || 'Unknown';
+    
+    console.log(`User ${myUsername} reported ${reportedUser} for ${reason}`);
+    
+    const timestamp = Date.now();
+    
+    let imageFilename = null;
+    if (screenshot) {
+      const base64Data = screenshot.replace(/^data:image\/jpeg;base64,/, "");
+      imageFilename = `report_${timestamp}.jpg`;
+      const imagePath = path.join(reportsDir, imageFilename);
+      fs.writeFile(imagePath, base64Data, 'base64', (err) => {
+        if(err) console.error("Error saving screenshot", err);
+      });
+    }
+
+    const logEntry = {
+       id: timestamp,
+       reporter: myUsername,
+       reported: reportedUser,
+       reason: reason,
+       time: new Date().toISOString(),
+       screenshot: imageFilename
+    };
+    
+    io.emit('admin-update');
+    
+    const mailOptions = {
+      from: '"Coll-Connect" <' + process.env.ADMIN_EMAIL + '>',
+      to: process.env.ADMIN_EMAIL,
+      subject: `New User Report: ${reportedUser}`,
+      text: `Hello Admin,\n\nA new report has been submitted.\n\nReporter: ${myUsername}\nReported User: ${reportedUser}\nReason: ${reason}\n\nPlease check the admin dashboard to view the screenshot and take action.`
+    };
+    transporter.sendMail(mailOptions, (error) => {
+      if (error) {
+        console.error("Error sending report email to admin:", error);
+      } else {
+        console.log(`[Email Sent] Report notification sent to admin for ${reportedUser}`);
+      }
+    });
+
+    
+    const logPath = path.join(reportsDir, 'reports.json');
+    let logs = [];
+    if (fs.existsSync(logPath)) {
+      try {
+        logs = JSON.parse(fs.readFileSync(logPath, 'utf8'));
+      } catch (e) {
+        console.error("Error reading reports file", e);
+      }
+    }
+    logs.push(logEntry);
+    fs.writeFileSync(logPath, JSON.stringify(logs, null, 2));
+
+    const roomId = socket.roomId;
+    if (roomId) {
+      socket.to(roomId).emit('partner-disconnected');
+      socket.leave(roomId);
+      socket.roomId = null;
+    }
+  });
+
+  socket.on('skip', () => {
+    waitingUsers = waitingUsers.filter(u => u.id !== socket.id);
+    const roomId = socket.roomId;
+    if (roomId) {
+      socket.to(roomId).emit('partner-disconnected');
+      socket.leave(roomId);
+      socket.roomId = null;
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+    if (socket.username && activeUsers.get(socket.username) === socket.id) {
+      activeUsers.delete(socket.username);
+    }
+    waitingUsers = waitingUsers.filter(u => u.id !== socket.id);
+    const roomId = socket.roomId;
+    if (roomId) {
+      socket.to(roomId).emit('partner-disconnected');
+    }
+  });
+});
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`Signaling server running on port ${PORT}`);
+});

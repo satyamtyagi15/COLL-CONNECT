@@ -1,0 +1,32 @@
+[
+  {
+    "id": 1781377444334,
+    "reporter": "Unknown",
+    "reported": "Unknown",
+    "reason": "Inappropriate Content",
+    "time": "2026-06-13T19:04:04.335Z"
+  },
+  {
+    "id": 1781379588994,
+    "reporter": "st15",
+    "reported": "St1515",
+    "reason": "Inappropriate Content",
+    "time": "2026-06-13T19:39:48.995Z"
+  },
+  {
+    "id": 1781393281882,
+    "reporter": "n1nx",
+    "reported": "St1515",
+    "reason": "Inappropriate Content",
+    "time": "2026-06-13T23:28:01.883Z",
+    "screenshot": "report_1781393281882.jpg"
+  },
+  {
+    "id": 1781768589504,
+    "reporter": "nandika",
+    "reported": "Stranger",
+    "reason": "Inappropriate Content",
+    "time": "2026-06-18T07:43:09.522Z",
+    "screenshot": "report_1781768589504.jpg"
+  }
+]
