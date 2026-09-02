@@ -83,7 +83,7 @@ sequenceDiagram
     SocketServer->>UserB: Forward Offer
     UserB->>SocketServer: Send WebRTC Answer
     SocketServer->>UserA: Forward Answer
-    UserA<->UserB: Direct P2P Video Stream Established
+    UserA->>UserB: Direct P2P Video Stream Established
 ```
 
 ### 3. Authentication Flow
